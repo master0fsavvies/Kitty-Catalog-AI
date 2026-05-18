@@ -1,0 +1,5 @@
+deleted_media/
+catlib.db
+__pycache__/
+*.pyc
+.env
