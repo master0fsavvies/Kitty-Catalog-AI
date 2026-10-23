@@ -14,7 +14,7 @@ def autosave_current_item():
         st.session_state.current_id,
         st.session_state.get(f"caption_{st.session_state.current_id}", ""),
         st.session_state.get(f"tags_{st.session_state.current_id}", ""),
-        st.session_state.get(f"vibe_{st.session_state.current_id}", ""),
+        st.session_state.get(f"example_context_{st.session_state.current_id}", ""),
         st.session_state.get(f"favorite_{st.session_state.current_id}", False)
     )
 
@@ -25,14 +25,16 @@ def get_media_item(item_id=None):
 
     if item_id is None:
         cursor.execute("""
-            SELECT id, file_path, file_name, media_type, caption, tags, vibe, favorite
+            SELECT id, file_path, file_name, media_type, caption, tags,
+                   example_context, favorite
             FROM media_items
             ORDER BY id
             LIMIT 1;
         """)
     else:
         cursor.execute("""
-            SELECT id, file_path, file_name, media_type, caption, tags, vibe, favorite
+            SELECT id, file_path, file_name, media_type, caption, tags,
+                   example_context, favorite
             FROM media_items
             WHERE id = ?;
         """, (item_id,))
@@ -87,7 +89,7 @@ def get_next_empty_id(current_id):
           AND (
             caption = ''
             OR tags = ''
-            OR vibe = ''
+            OR example_context = ''
           )
         ORDER BY id
         LIMIT 1;
@@ -109,7 +111,7 @@ def get_previous_empty_id(current_id):
           AND (
             caption = ''
             OR tags = ''
-            OR vibe = ''
+            OR example_context = ''
           )
         ORDER BY id DESC
         LIMIT 1;
@@ -132,7 +134,7 @@ def get_progress_counts():
         FROM media_items
         WHERE caption != ''
           AND tags != ''
-          AND vibe != '';
+          AND example_context != '';
     """)
     complete = cursor.fetchone()[0]
 
@@ -166,7 +168,7 @@ def get_item_by_metadata_search(search_text):
         FROM media_items
         WHERE caption LIKE ?
            OR tags LIKE ?
-           OR vibe LIKE ?
+           OR example_context LIKE ?
         ORDER BY id
         LIMIT 20;
     """, (
@@ -195,7 +197,7 @@ def media_id_exists(item_id):
     return row is not None
 
 
-def update_media_item(item_id, caption, tags, vibe, favorite):
+def update_media_item(item_id, caption, tags, example_context, favorite):
     conn = get_connection()
     cursor = conn.cursor()
 
@@ -203,13 +205,13 @@ def update_media_item(item_id, caption, tags, vibe, favorite):
         UPDATE media_items
         SET caption = ?,
             tags = ?,
-            vibe = ?,
+            example_context = ?,
             favorite = ?
         WHERE id = ?;
     """, (
         caption,
         tags,
-        vibe,
+        example_context,
         1 if favorite else 0,
         item_id
     ))
@@ -360,7 +362,16 @@ if item is None:
     st.error("Media item not found.")
     st.stop()
 
-item_id, file_path, file_name, media_type, caption, tags, vibe, favorite = item
+(
+    item_id,
+    file_path,
+    file_name,
+    media_type,
+    caption,
+    tags,
+    example_context,
+    favorite,
+) = item
 
 left, right = st.columns([1, 2])
 
@@ -426,7 +437,7 @@ with right:
             st.info("No filename matches found.")
 
     metadata_search = st.text_input(
-        "Search caption / tags / vibe",
+        "Search caption / tags / example context",
         key="metadata_search"
     )
 
@@ -465,6 +476,16 @@ with right:
         """
     )
 
+    new_example_context = st.text_area(
+        "Example context",
+        value=example_context or "",
+        key=f"example_context_{item_id}",
+        help=(
+            "Write one situation per line where this image/video would fit. "
+            "Example: 'When your mom says you cannot play Xbox.'"
+        )
+    )
+
     new_tags = st.text_area(
         "Tags",
         value=tags or "",
@@ -473,17 +494,6 @@ with right:
         List of comma-separated searchable concepts.
 
         Example: 'shopping cart, orange cat, crying, blue, thumbs up'
-        """
-    )
-
-    new_vibe = st.text_input(
-        "Vibe",
-        value=vibe or "",
-        key=f"vibe_{item_id}",
-        help="""
-        List of single words to describe emotional or social tone.
-
-        Examples: chaotic, tragic, supportive, dramatic, resigned
         """
     )
 
@@ -498,7 +508,7 @@ with right:
             item_id,
             new_caption,
             new_tags,
-            new_vibe,
+            new_example_context,
             new_favorite
         )
         st.success("Saved.")

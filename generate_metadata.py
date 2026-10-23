@@ -2,6 +2,8 @@ import os
 import warnings
 import logging
 import sqlite3
+import json
+import re
 from PIL import Image
 
 # Reduce noisy warnings/logs.
@@ -19,7 +21,7 @@ logging.getLogger("urllib3").setLevel(logging.ERROR)
 
 import torch
 import librosa
-import whisper
+from faster_whisper import WhisperModel
 import ollama
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -55,7 +57,6 @@ def clean_comma_list(text, max_words=4):
         "improved tags",
         "caption:",
         "tags:",
-        "vibe:",
         "note:",
         "i included",
         "i'd be happy",
@@ -82,7 +83,7 @@ def clean_comma_list(text, max_words=4):
     for part in parts:
         tag = part.strip().lower().strip(" .;:-\"'")
 
-        for prefix in ["clap:", "tags:", "vibe:", "caption:"]:
+        for prefix in ["clap:", "tags:", "caption:"]:
             if tag.startswith(prefix):
                 tag = tag.replace(prefix, "", 1).strip()
 
@@ -95,11 +96,9 @@ def clean_comma_list(text, max_words=4):
         if any(fragment in tag for fragment in bad_fragments):
             continue
 
-        # Limit tag length.
         if len(tag.split()) > max_words:
             continue
 
-        # Remove sentence-like outputs.
         if tag.endswith(".") or " i " in f" {tag} ":
             continue
 
@@ -123,16 +122,86 @@ def merge_comma_lists(*items):
     return ", ".join(merged)
 
 
+def parse_json_response(raw):
+    """Parse JSON even if Ollama adds a small amount of extra text."""
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not match:
+            raise
+        return json.loads(match.group(0))
+
+
+def clean_example_contexts(contexts, limit=5):
+    """Keep only short, usable situation prompts returned by Ollama."""
+    if not isinstance(contexts, list):
+        return []
+
+    cleaned = []
+    seen = set()
+
+    for context in contexts:
+        context = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", str(context))
+        context = " ".join(context.strip().split())
+
+        if not context:
+            continue
+
+        key = context.casefold()
+        if key not in seen:
+            seen.add(key)
+            cleaned.append(context)
+
+        if len(cleaned) >= limit:
+            break
+
+    return cleaned
+
+
+def parse_stored_contexts(text):
+    """Read quoted comma-separated contexts or older line-separated contexts."""
+    text = (text or "").strip()
+
+    if not text:
+        return []
+
+    try:
+        parsed = json.loads(f"[{text}]")
+        if isinstance(parsed, list):
+            return clean_example_contexts(parsed)
+    except json.JSONDecodeError:
+        pass
+
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            return clean_example_contexts(parsed)
+    except json.JSONDecodeError:
+        pass
+
+    return clean_example_contexts(text.splitlines())
+
+
+def format_example_contexts(contexts):
+    """Store contexts as quoted, comma-separated sentences."""
+    return ", ".join(
+        json.dumps(context, ensure_ascii=False)
+        for context in clean_example_contexts(contexts)
+    )
+
+
 def get_empty_metadata_items():
     conn = get_connection()
     cursor = conn.cursor()
 
     cursor.execute("""
-        SELECT id, file_path, file_name, media_type, caption, tags, vibe
+        SELECT id, file_path, file_name, media_type, caption, tags,
+               example_context
         FROM media_items
         WHERE caption = ''
            OR tags = ''
-           OR vibe = ''
+           OR example_context = ''
         ORDER BY id;
     """)
 
@@ -141,7 +210,7 @@ def get_empty_metadata_items():
     return rows
 
 
-def update_metadata(item_id, caption, tags, vibe):
+def update_metadata(item_id, caption, tags, example_context):
     conn = get_connection()
     cursor = conn.cursor()
 
@@ -149,9 +218,9 @@ def update_metadata(item_id, caption, tags, vibe):
         UPDATE media_items
         SET caption = ?,
             tags = ?,
-            vibe = ?
+            example_context = ?
         WHERE id = ?;
-    """, (caption, tags, vibe, item_id))
+    """, (caption, tags, example_context, item_id))
 
     conn.commit()
     conn.close()
@@ -193,19 +262,60 @@ def ask_ollama(prompt):
     return response["message"]["content"].strip()
 
 
+def normalize_ocr_text(text):
+    text = (text or "").strip()
+
+    if not text:
+        return ""
+
+    no_text_values = {
+        "no_text",
+        "no text",
+        "no visible text",
+        "none",
+        "n/a",
+        "there is no text visible",
+        "there is no visible text",
+    }
+
+    if text.strip().lower().strip(".") in no_text_values:
+        return ""
+
+    return text
+
+
 def generate_visual_metadata(model, tokenizer, image):
     enc_image = model.encode_image(image)
 
-    caption = model.answer_question(
+    ocr_text = model.answer_question(
         enc_image,
         (
-            "Describe the full image in one detailed sentence. "
-            "Include the main subject, setting, action, and mood. "
-            "If visible text appears, include the exact text too. "
-            "Do not only transcribe the text; describe what is visually happening."
+            "Read every piece of visible text in this image. "
+            "Include meme captions, subtitles, signs, labels, usernames, "
+            "watermarks, speech bubbles, logos containing words, and background text. "
+            "Do not summarize. Transcribe exactly. "
+            "If there are multiple text regions, include them all. "
+            "If no text exists, respond with exactly: NO_TEXT"
         ),
         tokenizer
     ).strip()
+
+    scene_description = model.answer_question(
+        enc_image,
+        (
+            "Describe what is visually happening in the image in one detailed sentence. "
+            "Include the main subject, setting, action, expressions, and mood. "
+            "Do not transcribe or mention any visible text."
+        ),
+        tokenizer
+    ).strip()
+
+    ocr_text = normalize_ocr_text(ocr_text)
+
+    if ocr_text:
+        caption = f"{scene_description} Visible text: {ocr_text}"
+    else:
+        caption = scene_description
 
     tags = model.answer_question(
         enc_image,
@@ -216,26 +326,20 @@ def generate_visual_metadata(model, tokenizer, image):
         tokenizer
     ).strip()
 
-    vibe = model.answer_question(
-        enc_image,
-        (
-            "Describe the emotional/social vibe using 3 to 5 "
-            "comma-separated words. Return only comma-separated words."
-        ),
-        tokenizer
-    ).strip()
-
-    return caption, tags, vibe
+    return caption, tags
 
 
 def transcribe_with_whisper(whisper_model, file_path):
-    result = whisper_model.transcribe(
+    segments, info = whisper_model.transcribe(
         file_path,
-        fp16=False,
-        verbose=False
+        beam_size=5
     )
 
-    return result.get("text", "").strip()
+    return " ".join(
+        segment.text.strip()
+        for segment in segments
+        if segment.text.strip()
+    )
 
 
 def classify_audio_with_clap(clap_model, clap_processor, file_path, top_n=8):
@@ -308,10 +412,10 @@ Tags: worst place, doomed, regret, dramatic, narration
 def refine_metadata_with_ollama(
     original_caption,
     visual_tags,
-    visual_vibe,
     transcript="",
     transcript_tags="",
-    clap_labels=""
+    clap_labels="",
+    existing_context=""
 ):
     prompt = f"""
 You are generating metadata for a searchable cat meme database.
@@ -321,9 +425,6 @@ Current visual caption:
 
 Visual tags:
 {visual_tags}
-
-Visual vibe:
-{visual_vibe}
 
 Audio transcript from Whisper, for context only:
 {transcript}
@@ -335,47 +436,77 @@ Audio labels from CLAP:
 {clap_labels}
 
 Task:
-Return improved metadata.
+Return improved metadata and five short, broad, reusable texting prompts.
 
 Rules:
-- Return exactly this format:
-CAPTION: ...
-TAGS: ...
-VIBE: ...
+- Return ONLY valid JSON with exactly these keys:
+  "caption": one string,
+  "tags": an array of short lowercase strings,
+  "example_context": an array containing exactly five strings.
 - Caption should be one sentence.
+- Caption should preserve important visible text if included.
 - Caption should describe the visual scene, not only the text.
-- Tags should be comma-separated.
-- Vibe should be comma-separated.
+- Tags should be lower case and short.
 - Tags should include literal objects, visible text concepts, audio concepts, meme meanings, and likely search terms.
+- Tags should also include overall emotion, setting, or action.
 - Do not copy full transcript sentences into tags.
 - Use transcript only to create short search tags.
 - CLAP audio labels should be used as separate tags when relevant.
-- Vibe should describe emotional/social reaction energy.
-- Do not explain your reasoning.
+- Example contexts should be setups, emotional statements, questions,
+  greetings, or broad topic references—not complete jokes or punchlines.
+- Keep each prompt between 2 and 10 words when possible.
+- Prefer vague, reusable language over specific narratives.
+- Use only information supported by the caption, tags, transcript, or audio labels.
+- Do not invent events, backstories, locations, objects, or actions.
+- Do not mention objects that are not visible or explicitly supported.
+- Do not imply hidden events such as cooking, going to work, arriving home,
+  losing something, or having an argument.
+- Do not make every prompt about the cat itself.
+- Do not use generic words such as cat, kitten, pet, cute, or meme.
+- Preserve the apparent emotional intensity. Do not turn mild sadness into grief.
+- Do not require prompts to begin with "When...", "That feeling when...",
+  or "Me when...".
+- Make the five prompts meaningfully different when possible.
+- Do not include numbering, markdown, or explanations outside the JSON.
+
+Existing example context, if any:
+{existing_context}
 
 Good tag examples:
-revolt, busy, distraction, avoidance, satire, car horn, angry meow, chaos, refusal
+["revolt", "busy", "distraction", "avoidance", "satire", "car horn", "angry meow", "chaos", "refusal"]
 """
 
     response = ask_ollama(prompt)
 
     caption = original_caption
     tags = visual_tags
-    vibe = visual_vibe
+    example_context = parse_stored_contexts(existing_context)
 
-    for line in response.splitlines():
-        line = line.strip()
+    try:
+        data = parse_json_response(response)
 
-        if line.lower().startswith("caption:"):
-            caption = line.split(":", 1)[1].strip()
+        if isinstance(data, dict):
+            caption = str(data.get("caption", caption)).strip() or caption
 
-        elif line.lower().startswith("tags:"):
-            tags = line.split(":", 1)[1].strip()
+            returned_tags = data.get("tags", [])
+            if isinstance(returned_tags, list):
+                cleaned_tags = clean_comma_list(
+                    ", ".join(str(tag) for tag in returned_tags)
+                )
+                if cleaned_tags:
+                    tags = ", ".join(cleaned_tags)
 
-        elif line.lower().startswith("vibe:"):
-            vibe = line.split(":", 1)[1].strip()
+            returned_context = clean_example_contexts(
+                data.get("example_context", [])
+            )
+            if returned_context:
+                example_context = returned_context
 
-    return caption, tags, vibe
+    except (json.JSONDecodeError, TypeError, ValueError) as error:
+        print(f"Warning: Ollama returned invalid metadata JSON: {error}")
+        print(response)
+
+    return caption, tags, example_context
 
 
 def main():
@@ -400,14 +531,26 @@ def main():
     )
 
     print("Loading Whisper...")
-    whisper_model = whisper.load_model(WHISPER_MODEL_SIZE)
+    whisper_model = WhisperModel(
+        WHISPER_MODEL_SIZE,
+        device="cpu",
+        compute_type="int8"
+    )
 
     print("Loading CLAP...")
     clap_model = ClapModel.from_pretrained(CLAP_MODEL_ID)
     clap_processor = ClapProcessor.from_pretrained(CLAP_MODEL_ID)
 
     for index, row in enumerate(items, start=1):
-        item_id, file_path, file_name, media_type, old_caption, old_tags, old_vibe = row
+        (
+            item_id,
+            file_path,
+            file_name,
+            media_type,
+            old_caption,
+            old_tags,
+            old_context,
+        ) = row
 
         print("\n" + "=" * 80)
         print(f"[{index}/{len(items)}] ID {item_id}: {file_name}")
@@ -418,19 +561,28 @@ def main():
             continue
 
         try:
+            old_caption = old_caption or ""
+            old_tags = old_tags or ""
+            old_context = old_context or ""
+
             if media_type == "image":
-                image = load_image_from_file(file_path)
+                if old_caption.strip() and old_tags.strip():
+                    # The image has already been labeled. Only generate the
+                    # new example contexts instead of re-running Moondream.
+                    md_caption, md_tags = old_caption, old_tags
+                else:
+                    image = load_image_from_file(file_path)
 
-                md_caption, md_tags, md_vibe = generate_visual_metadata(
-                    moondream_model,
-                    tokenizer,
-                    image
-                )
+                    md_caption, md_tags = generate_visual_metadata(
+                        moondream_model,
+                        tokenizer,
+                        image
+                    )
 
-                final_caption, refined_tags, refined_vibe = refine_metadata_with_ollama(
+                final_caption, refined_tags, example_context = refine_metadata_with_ollama(
                     original_caption=old_caption.strip() or md_caption,
                     visual_tags=old_tags.strip() or md_tags,
-                    visual_vibe=old_vibe.strip() or md_vibe
+                    existing_context=old_context.strip()
                 )
 
                 final_tags = old_tags.strip() or merge_comma_lists(
@@ -438,44 +590,47 @@ def main():
                     refined_tags
                 )
 
-                final_vibe = old_vibe.strip() or merge_comma_lists(
-                    md_vibe,
-                    refined_vibe
-                )
-
             elif media_type == "video":
-                image = load_image_from_video(file_path)
+                if old_caption.strip() and old_tags.strip():
+                    # Existing caption/tags are enough to create contexts.
+                    # Avoid decoding the video and running Whisper/CLAP again.
+                    md_caption, md_tags = old_caption, old_tags
+                    transcript = ""
+                    transcript_tags = ""
+                    clap_labels = ""
+                else:
+                    image = load_image_from_video(file_path)
 
-                md_caption, md_tags, md_vibe = generate_visual_metadata(
-                    moondream_model,
-                    tokenizer,
-                    image
-                )
+                    md_caption, md_tags = generate_visual_metadata(
+                        moondream_model,
+                        tokenizer,
+                        image
+                    )
 
-                transcript = transcribe_with_whisper(
-                    whisper_model,
-                    file_path
-                )
+                    transcript = transcribe_with_whisper(
+                        whisper_model,
+                        file_path
+                    )
 
-                transcript_tags = extract_transcript_tags_with_ollama(
-                    transcript
-                )
+                    transcript_tags = extract_transcript_tags_with_ollama(
+                        transcript
+                    )
 
-                clap_results = classify_audio_with_clap(
-                    clap_model,
-                    clap_processor,
-                    file_path
-                )
+                    clap_results = classify_audio_with_clap(
+                        clap_model,
+                        clap_processor,
+                        file_path
+                    )
 
-                clap_labels = format_clap_labels(clap_results)
+                    clap_labels = format_clap_labels(clap_results)
 
-                final_caption, refined_tags, refined_vibe = refine_metadata_with_ollama(
+                final_caption, refined_tags, example_context = refine_metadata_with_ollama(
                     original_caption=old_caption.strip() or md_caption,
                     visual_tags=old_tags.strip() or md_tags,
-                    visual_vibe=old_vibe.strip() or md_vibe,
                     transcript=transcript,
                     transcript_tags=transcript_tags,
-                    clap_labels=clap_labels
+                    clap_labels=clap_labels,
+                    existing_context=old_context.strip()
                 )
 
                 final_tags = old_tags.strip() or merge_comma_lists(
@@ -483,11 +638,6 @@ def main():
                     transcript_tags,
                     clap_labels,
                     refined_tags
-                )
-
-                final_vibe = old_vibe.strip() or merge_comma_lists(
-                    md_vibe,
-                    refined_vibe
                 )
 
                 print("Transcript:", transcript)
@@ -502,12 +652,14 @@ def main():
                 item_id=item_id,
                 caption=final_caption,
                 tags=final_tags,
-                vibe=final_vibe
+                example_context=format_example_contexts(example_context)
             )
 
             print("Caption:", final_caption)
             print("Tags:", final_tags)
-            print("Vibe:", final_vibe)
+            print("Example context:")
+            for context in example_context:
+                print(f"- {context}")
             print("Saved.")
 
         except Exception as e:

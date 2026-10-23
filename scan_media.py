@@ -50,14 +50,16 @@ def scan_media_folder():
                         file_path,
                         file_name,
                         media_type,
-                        file_hash
+                        file_hash,
+                        example_context
                     )
-                    VALUES (?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?)
                 """, (
                     file_path,
                     file_name,
                     media_type,
-                    file_hash
+                    file_hash,
+                    ""
                 ))
 
                 added_count += 1

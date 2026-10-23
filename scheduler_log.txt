@@ -1,0 +1,25 @@
+============================== 
+Started: Fri 06/05/2026 20:28:52.80 
+User: John 
+Folder: C:\Users\John\Desktop\Kitty AI 
+Launched pythonw: Fri 06/05/2026 20:28:52.82 
+============================== 
+Started: Fri 06/05/2026 20:29:14.10 
+User: John 
+Folder: C:\Users\John\Desktop\Kitty AI 
+Launched pythonw: Fri 06/05/2026 20:29:14.12 
+============================== 
+Started: Fri 06/05/2026 20:29:47.35 
+User: John 
+Folder: C:\Users\John\Desktop\Kitty AI 
+Launched pythonw: Fri 06/05/2026 20:29:47.37 
+============================== 
+Started: Fri 06/05/2026 20:30:06.76 
+User: John 
+Folder: C:\Users\John\Desktop\Kitty AI 
+Launched pythonw: Fri 06/05/2026 20:30:06.78 
+============================== 
+Started: Fri 06/05/2026 20:30:11.97 
+User: John 
+Folder: C:\Users\John\Desktop\Kitty AI 
+Launched pythonw: Fri 06/05/2026 20:30:12.00 

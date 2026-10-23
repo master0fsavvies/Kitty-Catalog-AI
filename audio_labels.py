@@ -1,11 +1,11 @@
 CLAP_CANDIDATE_LABELS = [
     # Cats / animals
-    "cat meowing",
     "angry cat meowing",
     "sad cat meowing",
-    "kitten meowing",
-    "cat yowling",
-    "animal sounds",
+    "baby kitten meowing",
+    "happy cat meowing",
+    "loud cat meowing",
+
 
     # Human voice
     "speech",
@@ -16,13 +16,23 @@ CLAP_CANDIDATE_LABELS = [
     "laughing",
 
     # Music
-    "music",
     "sad music",
+    "party music",
+    "relaxed music",
+    "intense music",
+    "happy music",
+    "baby music",
+    "ethnic music",
+    "pop music"
     "dramatic music",
     "funny music",
     "chaotic music",
     "romantic music",
     "suspenseful music",
+    "christmas music",
+    "epic music",
+    "horror music",
+    "meditation music",
 
     # SFX / meme sounds
     "car horn honking",
@@ -37,12 +47,16 @@ CLAP_CANDIDATE_LABELS = [
     "cash register beeping",
 
     # Chaos / impacts
-    "crashing noise",
+    "crash",
     "glass breaking",
     "metal clanging",
-    "things falling",
+    "cartoon sound effects",
     "chaotic noise",
     "loud noise",
+    "quiet noise",
+    "electronic noise",
+    "phone",
+    "computer",
 
     # Environment
     "restaurant sounds",

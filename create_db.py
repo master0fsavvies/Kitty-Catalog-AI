@@ -15,7 +15,8 @@ CREATE TABLE IF NOT EXISTS media_items (
 
     caption TEXT DEFAULT '',
     tags TEXT DEFAULT '',
-    vibe TEXT DEFAULT '',
+    example_context TEXT DEFAULT '',
+    context_embedding TEXT DEFAULT '',
 
     favorite INTEGER DEFAULT 0,
     date_added TEXT DEFAULT CURRENT_TIMESTAMP
