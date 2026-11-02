@@ -3,3 +3,6 @@ catlib.db
 __pycache__/
 *.pyc
 .env
+token.txt
+.venv/
+*.sqlite-journal

@@ -1,348 +1,201 @@
-import sys
+"""Context-only semantic retrieval for Kitty CATalog.
+
+No tags, captions, or chat-model reranking are used to select media.
+The public find_media(prompt, limit=10) interface remains compatible with the bot.
+"""
 import json
+import math
+import os
 import re
 import sqlite3
-import math
-import ollama
+import sys
+from pathlib import Path
 
-DB_PATH = "catlib.db"
-
-CHAT_MODEL = "llama3.2:latest"
-EMBED_MODEL = "nomic-embed-text:latest"
+DB_PATH = os.environ.get('KITTY_DB_PATH', str(Path(__file__).resolve().parent / 'catlib.db'))
+EMBED_MODEL = os.environ.get('KITTY_EMBED_MODEL', 'nomic-embed-text:latest')
 
 
 def get_connection():
-    return sqlite3.connect(DB_PATH)
+    return sqlite3.connect(DB_PATH, timeout=30)
 
 
-def parse_json(raw):
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", raw, re.DOTALL)
-        if match:
-            return json.loads(match.group(0))
-        raise
+def parse_contexts(value):
+    """Support JSON arrays, the generator's comma-separated JSON strings, and lines."""
+    if not value:
+        return []
+    if isinstance(value, (list, tuple)):
+        values = value
+    else:
+        raw = str(value).strip()
+        if not raw:
+            return []
+        try:
+            decoded = json.loads(raw)
+            values = decoded if isinstance(decoded, list) else [decoded]
+        except (ValueError, TypeError):
+            try:
+                decoded = json.loads('[' + raw + ']')
+                values = decoded if isinstance(decoded, list) else [raw]
+            except (ValueError, TypeError):
+                values = raw.splitlines()
+    result, seen = [], set()
+    for item in values:
+        if not isinstance(item, str):
+            continue
+        item = re.sub(r'^\s*(?:[-*]|\d+[.)])\s*', '', item).strip()
+        item = ' '.join(item.split())
+        if item and item.casefold() not in seen:
+            seen.add(item.casefold())
+            result.append(item)
+    return result
 
 
 def get_embedding(text):
-    response = ollama.embeddings(
-        model=EMBED_MODEL,
-        prompt=text
-    )
-    return response["embedding"]
+    try:
+        import ollama
+    except ImportError as exc:
+        raise RuntimeError('Install Ollama Python package: pip install ollama') from exc
+    try:
+        if hasattr(ollama, 'embed'):
+            response = ollama.embed(model=EMBED_MODEL, input=text)
+            vector = response['embeddings'][0]
+        else:
+            response = ollama.embeddings(model=EMBED_MODEL, prompt=text)
+            vector = response['embedding']
+        if not vector or not all(math.isfinite(float(v)) for v in vector):
+            raise ValueError('Embedding contains invalid values')
+        return [float(v) for v in vector]
+    except Exception as exc:
+        raise RuntimeError(f'Could not embed text using Ollama model {EMBED_MODEL}. '
+                           'Ensure Ollama is running and the model is pulled.') from exc
 
 
 def cosine_similarity(a, b):
+    if not a or not b or len(a) != len(b):
+        return 0.0
     dot = sum(x * y for x, y in zip(a, b))
     mag_a = math.sqrt(sum(x * x for x in a))
     mag_b = math.sqrt(sum(y * y for y in b))
-
-    if mag_a == 0 or mag_b == 0:
-        return 0
-
-    return dot / (mag_a * mag_b)
+    return dot / (mag_a * mag_b) if mag_a > 0 and mag_b > 0 else 0.0
 
 
-def generate_search_tags(prompt):
-    instruction = f"""
-You are generating search tags for a cat meme/media database.
-
-Every media item is already a cat, so do not use generic tags like:
-cat, kitten, cute, meme, funny, animal, pet.
-
-Your goal is retrieval quality.
-
-Do not create compound words.
-Bad tags:
-pickuprequest, sisterpicksmeup, schoolrun, familymember
-
-Good tags:
-pickup, ride, car, driving, waiting, school, leaving, hurry, obligation, responsibility, annoyed
-
-Texting situation:
-{prompt}
-
-Rules:
-- Return ONLY valid JSON.
-- Return exactly one JSON object, not a list.
-- Do not explain your answer.
-- Do not include markdown.
-- Use lowercase.
-- Use normal reusable search tags.
-- Prefer single words.
-- Short phrases are okay only if natural.
-- Include actions, emotions, situations, reactions, and meme concepts.
-- Return 12 tags.
-
-Format:
-{{
-  "tags": ["pickup", "ride", "waiting"]
-}}
-"""
-
-    response = ollama.chat(
-        model=CHAT_MODEL,
-        messages=[{"role": "user", "content": instruction}]
-    )
-
-    raw = response["message"]["content"].strip()
-
+def _read_cache(value, contexts):
+    if not value:
+        return {}
     try:
-        data = parse_json(raw)
-    except Exception:
-        print("Model returned invalid JSON:")
-        print(raw)
-        return []
+        cache = json.loads(value)
+        if (isinstance(cache, dict) and cache.get('model') == EMBED_MODEL
+                and cache.get('contexts') == contexts and isinstance(cache.get('vectors'), list)
+                and len(cache['vectors']) == len(contexts)):
+            vectors = cache['vectors']
+            if all(isinstance(v, list) and v and all(isinstance(x, (float, int)) and math.isfinite(x) for x in v)
+                   for v in vectors) and len({len(v) for v in vectors}) == 1:
+                return cache
+    except (ValueError, TypeError):
+        pass
+    return {}
 
-    if isinstance(data, dict):
-        tags = data.get("tags", [])
-    elif isinstance(data, list):
-        tags = []
-        for group in data:
-            if isinstance(group, dict):
-                tags.extend(group.get("tags", []))
-    else:
-        tags = []
 
-    clean_tags = []
+def resolve_media_path(stored_path):
+    """Resolve Windows-style DB paths on Windows, Linux and macOS."""
+    if not stored_path:
+        return ''
+    path = Path(str(stored_path).replace('\\', '/'))
+    if path.is_absolute():
+        return str(path)
+    return str((Path(__file__).resolve().parent / path).resolve())
 
-    banned = {
-        "cat", "cats", "kitten", "kittens",
-        "cute", "meme", "funny", "animal", "pet"
-    }
 
-    for tag in tags:
-        tag = str(tag).strip().lower()
-
-        if not tag:
-            continue
-
-        if tag in banned:
-            continue
-
-        clean_tags.append(tag)
-
-    return clean_tags
+def warm_context_cache():
+    """Precompute missing/stale context vectors once (requires Ollama)."""
+    items = get_media_items()
+    with get_connection() as conn:
+        for index, item in enumerate(items, 1):
+            _get_context_vectors(conn, item)
+            if index % 10 == 0 or index == len(items):
+                print(f'Cached {index}/{len(items)} media items')
+    return len(items)
 
 
 def get_media_items():
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        SELECT id, file_path, file_name, media_type, caption, tags, favorite
-        FROM media_items
-        WHERE tags != ''
-        ORDER BY id;
-    """)
-
-    rows = cursor.fetchall()
-    conn.close()
-
+    """Only context fields are loaded for ranking; no tag/caption dependencies."""
+    with get_connection() as conn:
+        rows = conn.execute('''SELECT id, file_path, file_name, media_type,
+                                     example_context, context_embedding, favorite
+                              FROM media_items ORDER BY id''').fetchall()
     items = []
-
-    for row in rows:
-        item_id, file_path, file_name, media_type, caption, tags, favorite = row
-
-        items.append({
-            "id": item_id,
-            "file_path": file_path,
-            "file_name": file_name,
-            "media_type": media_type,
-            "caption": caption or "",
-            "tags": tags or "",
-            "favorite": bool(favorite),
-        })
-
+    for item_id, path, name, kind, raw_contexts, cache, favorite in rows:
+        contexts = parse_contexts(raw_contexts)
+        if contexts:
+            items.append({'id': item_id, 'file_path': resolve_media_path(path), 'file_name': name,
+                          'media_type': kind, 'favorite': bool(favorite),
+                          'contexts': contexts, 'cache': cache})
     return items
 
 
-def item_search_text(item):
-    return item["tags"].strip()
-
-
-def rerank_top_candidates(prompt, candidates, max_picks=3):
-    option_lines = []
-
-    for index, item in enumerate(candidates, start=1):
-        option_lines.append(
-            f"{index}. ID: {item['id']}\n"
-            f"Caption: {item['caption']}\n"
-            f"Tags: {item['tags']}\n"
-            f"Vector score: {item['score']:.3f}"
-        )
-
-    option_text = "\n\n".join(option_lines)
-
-    instruction = f"""
-You are choosing the best cat media for a texting situation.
-
-The candidates were already selected by tag similarity.
-Now choose the best final matches using the captions.
-
-Texting situation:
-{prompt}
-
-Candidates:
-{option_text}
-
-Rules:
-- Return ONLY valid JSON.
-- Return exactly one JSON object, not a list.
-- Do not include markdown.
-- You MUST return exactly {max_picks} recommendations.
-- Always choose the best available options.
-- Never return fewer than {max_picks}.
-- Use only index numbers from the candidate list.
-- Prefer captions that match the situation, emotion, reaction, or joke.
-- Do not pick based only on being a cat.
-- Include a short explanation for why each selected item fits.
-
-Format:
-{{
-  "recommendations": [
-    {{
-      "index": 1,
-      "reason": "short explanation"
-    }},
-    {{
-      "index": 2,
-      "reason": "short explanation"
-    }},
-    {{
-      "index": 3,
-      "reason": "short explanation"
-    }}
-  ]
-}}
-"""
-
-    response = ollama.chat(
-        model=CHAT_MODEL,
-        messages=[{"role": "user", "content": instruction}]
-    )
-
-    raw = response["message"]["content"].strip()
-
-    try:
-        data = parse_json(raw)
-    except Exception:
-        print("Reranker returned invalid JSON:")
-        print(raw)
-
-        fallback = []
-        for candidate in candidates[:max_picks]:
-            item = dict(candidate)
-            item["reason"] = "Strong semantic match from tag search."
-            fallback.append(item)
-
-        return fallback
-
-    recommendations = data.get("recommendations", [])
-
-    selected = []
-    used_ids = set()
-
-    for rec in recommendations:
-        try:
-            idx = int(rec.get("index"))
-            reason = str(rec.get("reason", "")).strip()
-
-            if 1 <= idx <= len(candidates):
-                item = dict(candidates[idx - 1])
-
-                if item["id"] in used_ids:
-                    continue
-
-                item["reason"] = reason or "Strong caption match."
-                selected.append(item)
-                used_ids.add(item["id"])
-
-        except (ValueError, TypeError, AttributeError):
-            pass
-
-    for candidate in candidates:
-        if len(selected) >= max_picks:
-            break
-
-        if candidate["id"] not in used_ids:
-            item = dict(candidate)
-            item["reason"] = "Strong semantic match from tag search."
-            selected.append(item)
-            used_ids.add(item["id"])
-
-    return selected[:max_picks]
+def _get_context_vectors(conn, item):
+    contexts = item['contexts']
+    cached = _read_cache(item['cache'], contexts)
+    if cached:
+        return cached['vectors']
+    vectors = [get_embedding(context) for context in contexts]
+    # Cache is keyed to both model and exact context strings. Edits automatically invalidate it.
+    cache = json.dumps({'model': EMBED_MODEL, 'contexts': contexts, 'vectors': vectors})
+    conn.execute('UPDATE media_items SET context_embedding = ? WHERE id = ?', (cache, item['id']))
+    return vectors
 
 
 def find_media(prompt, limit=10):
-    print(f"Prompt: {prompt!r}\n")
+    """Return top-ranked matches; the Telegram bot displays only the first three.
 
-    items = get_media_items()
-    print(f"Media options: {len(items)} tagged items")
-
-    query_tags = generate_search_tags(prompt)
-
-    if not query_tags:
-        print("No search tags generated.")
+    Video score = maximum cosine similarity across its example contexts.
+    A single relevant example context can therefore retrieve a video.
+    """
+    if not isinstance(prompt, str) or not prompt.strip():
         return []
-
-    query_text = ", ".join(query_tags)
-
-    print(f"Generated search tags: {query_text}\n")
-
-    query_embedding = get_embedding(query_text)
-
-    scored_items = []
-
-    for item in items:
-        tags_text = item_search_text(item)
-
-        if not tags_text:
-            continue
-
-        item_embedding = get_embedding(tags_text)
-        score = cosine_similarity(query_embedding, item_embedding)
-
-        scored_items.append({
-            **item,
-            "score": score,
-        })
-
-    scored_items.sort(key=lambda item: item["score"], reverse=True)
-
-    candidates = scored_items[:limit]
-
-    print(f"Top {len(candidates)} candidate(s) from tag search:\n")
-
-    for rank, item in enumerate(candidates, start=1):
-        fav = "★" if item["favorite"] else " "
-        print(f"{rank}. [{fav}] ID {item['id']} — {item['file_name']} | Score: {item['score']:.3f}")
-
-    print()
-
-    selected = rerank_top_candidates(prompt, candidates, max_picks=3)
-
-    print(f"{len(selected)} final recommendation(s):\n")
-
-    for rank, item in enumerate(selected, start=1):
-        fav = "★" if item["favorite"] else " "
-
-        print(f"{rank}. [{fav}] ID {item['id']} — {item['file_name']}")
-        print(f"   Score: {item['score']:.3f}")
-        print(f"   Reason: {item.get('reason', '')}")
-        print(f"   Type: {item['media_type']}")
-        print(f"   Path: {item['file_path']}")
-        print(f"   Caption: {item['caption']}")
-        print(f"   Tags: {item['tags']}")
-        print()
-
+    if not isinstance(limit, int) or limit < 1:
+        raise ValueError('limit must be a positive integer')
+    items = get_media_items()
+    if not items:
+        print('No media with example_context found. Generate metadata first.')
+        return []
+    query_vector = get_embedding(prompt.strip())
+    ranked = []
+    with get_connection() as conn:
+        for item in items:
+            vectors = _get_context_vectors(conn, item)
+            scored = [(cosine_similarity(query_vector, vector), context)
+                      for vector, context in zip(vectors, item['contexts'])
+                      if len(vector) == len(query_vector)]
+            if not scored:
+                continue
+            score, matched_context = max(scored, key=lambda entry: entry[0])
+            ranked.append({'id': item['id'], 'file_path': item['file_path'],
+                           'file_name': item['file_name'], 'media_type': item['media_type'],
+                           'favorite': item['favorite'], 'score': score,
+                           'matched_context': matched_context,
+                           'reason': f'Context match: {matched_context}'})
+    ranked.sort(key=lambda item: (-item['score'], item['id']))
+    selected = ranked[:limit]
+    for rank, item in enumerate(selected, 1):
+        print(f"{rank}. ID {item['id']} — {item['file_name']} | "
+              f"score={item['score']:.4f} | {item['matched_context']}")
     return selected
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
+    if len(sys.argv) == 2 and sys.argv[1] == '--warm-cache':
+        try:
+            warm_context_cache()
+        except (sqlite3.Error, RuntimeError) as exc:
+            print(f'Error: {exc}', file=sys.stderr)
+            sys.exit(1)
+        sys.exit(0)
     if len(sys.argv) < 2:
-        print('Usage: python kitty_ai.py "your prompt here"')
+        print('Usage: python kitty_ai.py "your message"')
         sys.exit(1)
-
-    find_media(" ".join(sys.argv[1:]))
+    try:
+        find_media(' '.join(sys.argv[1:]))
+    except (sqlite3.Error, RuntimeError) as exc:
+        print(f'Error: {exc}', file=sys.stderr)
+        sys.exit(1)
