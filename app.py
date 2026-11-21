@@ -503,7 +503,7 @@ with right:
         key=f"favorite_{item_id}"
     )
 
-    if st.button("Save", key=f"save_{item_id}", use_container_width=True):
+    if st.button("Save", key=f"save_{item_id}", width="stretch"):
         update_media_item(
             item_id,
             new_caption,
@@ -518,18 +518,18 @@ with right:
     col1, col2 = st.columns(2)
 
     with col1:
-        st.button("Previous", on_click=go_previous, use_container_width=True)
+        st.button("Previous", on_click=go_previous, width="stretch")
 
     with col2:
-        st.button("Next", on_click=go_next, use_container_width=True)
+        st.button("Next", on_click=go_next, width="stretch")
 
     col3, col4 = st.columns(2)
 
     with col3:
-        st.button("Previous empty", on_click=go_previous_empty, use_container_width=True)
+        st.button("Previous empty", on_click=go_previous_empty, width="stretch")
 
     with col4:
-        st.button("Next empty", on_click=go_next_empty, use_container_width=True)
+        st.button("Next empty", on_click=go_next_empty, width="stretch")
 
     st.divider()
 
@@ -538,7 +538,7 @@ with right:
         key=f"delete_confirm_{item_id}"
     )
 
-    if st.button("Delete from catalog", key=f"delete_{item_id}", use_container_width=True):
+    if st.button("Delete from catalog", key=f"delete_{item_id}", width="stretch"):
         if delete_confirm:
             next_item_id = go_to_best_after_delete(item_id)
             delete_media_item_and_file(item_id, file_path)

@@ -1,18 +1,15 @@
-"""Context-only semantic retrieval for Kitty CATalog.
-
-No tags, captions, or chat-model reranking are used to select media.
-The public find_media(prompt, limit=10) interface remains compatible with the bot.
-"""
 import json
 import math
 import os
 import re
 import sqlite3
 import sys
+from contextlib import closing
 from pathlib import Path
 
 DB_PATH = os.environ.get('KITTY_DB_PATH', str(Path(__file__).resolve().parent / 'catlib.db'))
 EMBED_MODEL = os.environ.get('KITTY_EMBED_MODEL', 'nomic-embed-text:latest')
+CONTEXT_MATCH_MODES = ('individual', 'whole')
 
 
 def get_connection():
@@ -20,7 +17,6 @@ def get_connection():
 
 
 def parse_contexts(value):
-    """Support JSON arrays, the generator's comma-separated JSON strings, and lines."""
     if not value:
         return []
     if isinstance(value, (list, tuple)):
@@ -48,6 +44,19 @@ def parse_contexts(value):
             seen.add(item.casefold())
             result.append(item)
     return result
+
+
+def split_context_sentences(contexts):
+    """Split each stored context into separately searchable sentences."""
+    sentences, seen = [], set()
+    for context in contexts:
+        for sentence in re.split(r'(?<=[.!?])\s+|\r?\n+', context):
+            sentence = ' '.join(sentence.split())
+            key = sentence.casefold()
+            if sentence and key not in seen:
+                seen.add(key)
+                sentences.append(sentence)
+    return sentences
 
 
 def get_embedding(text):
@@ -97,7 +106,6 @@ def _read_cache(value, contexts):
 
 
 def resolve_media_path(stored_path):
-    """Resolve Windows-style DB paths on Windows, Linux and macOS."""
     if not stored_path:
         return ''
     path = Path(str(stored_path).replace('\\', '/'))
@@ -107,9 +115,8 @@ def resolve_media_path(stored_path):
 
 
 def warm_context_cache():
-    """Precompute missing/stale context vectors once (requires Ollama)."""
     items = get_media_items()
-    with get_connection() as conn:
+    with closing(get_connection()) as conn, conn:
         for index, item in enumerate(items, 1):
             _get_context_vectors(conn, item)
             if index % 10 == 0 or index == len(items):
@@ -117,15 +124,23 @@ def warm_context_cache():
     return len(items)
 
 
-def get_media_items():
-    """Only context fields are loaded for ranking; no tag/caption dependencies."""
-    with get_connection() as conn:
+def get_media_items(context_mode='individual'):
+    if context_mode not in CONTEXT_MATCH_MODES:
+        raise ValueError(
+            f"context_mode must be one of {', '.join(CONTEXT_MATCH_MODES)}"
+        )
+    with closing(get_connection()) as conn, conn:
         rows = conn.execute('''SELECT id, file_path, file_name, media_type,
                                      example_context, context_embedding, favorite
                               FROM media_items ORDER BY id''').fetchall()
     items = []
     for item_id, path, name, kind, raw_contexts, cache, favorite in rows:
-        contexts = parse_contexts(raw_contexts)
+        stored_contexts = parse_contexts(raw_contexts)
+        if context_mode == 'individual':
+            contexts = split_context_sentences(stored_contexts)
+        else:
+            whole_context = ' '.join(stored_contexts)
+            contexts = [whole_context] if whole_context else []
         if contexts:
             items.append({'id': item_id, 'file_path': resolve_media_path(path), 'file_name': name,
                           'media_type': kind, 'favorite': bool(favorite),
@@ -145,23 +160,22 @@ def _get_context_vectors(conn, item):
     return vectors
 
 
-def find_media(prompt, limit=10):
-    """Return top-ranked matches; the Telegram bot displays only the first three.
-
-    Video score = maximum cosine similarity across its example contexts.
-    A single relevant example context can therefore retrieve a video.
-    """
+def find_media(prompt, limit=10, context_mode='individual'):
     if not isinstance(prompt, str) or not prompt.strip():
         return []
     if not isinstance(limit, int) or limit < 1:
         raise ValueError('limit must be a positive integer')
-    items = get_media_items()
+    if context_mode not in CONTEXT_MATCH_MODES:
+        raise ValueError(
+            f"context_mode must be one of {', '.join(CONTEXT_MATCH_MODES)}"
+        )
+    items = get_media_items(context_mode)
     if not items:
         print('No media with example_context found. Generate metadata first.')
         return []
     query_vector = get_embedding(prompt.strip())
     ranked = []
-    with get_connection() as conn:
+    with closing(get_connection()) as conn, conn:
         for item in items:
             vectors = _get_context_vectors(conn, item)
             scored = [(cosine_similarity(query_vector, vector), context)

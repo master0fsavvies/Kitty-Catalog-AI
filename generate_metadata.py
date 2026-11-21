@@ -6,7 +6,6 @@ import json
 import re
 from PIL import Image
 
-# Reduce noisy warnings/logs.
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -459,11 +458,8 @@ Rules:
 - Use only information supported by the caption, tags, transcript, or audio labels.
 - Do not invent events, backstories, locations, objects, or actions.
 - Do not mention objects that are not visible or explicitly supported.
-- Do not imply hidden events such as cooking, going to work, arriving home,
-  losing something, or having an argument.
-- Do not make every prompt about the cat itself.
 - Do not use generic words such as cat, kitten, pet, cute, or meme.
-- Preserve the apparent emotional intensity. Do not turn mild sadness into grief.
+- Preserve the apparent emotional intensity. Do not turn mild sadness into intense grief.
 - Do not require prompts to begin with "When...", "That feeling when...",
   or "Me when...".
 - Make the five prompts meaningfully different when possible.
